@@ -1,0 +1,3 @@
+*.log
+bt-verify-diag.txt
+.DS_Store
