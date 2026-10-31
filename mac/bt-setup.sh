@@ -495,6 +495,22 @@ cmd_new_project() {
   ( cd "$dir" && mvn -B -q archetype:generate \
       -DarchetypeGroupId="$group" -DarchetypeArtifactId="$arch" -DarchetypeVersion="$ver" \
       -DgroupId="com.$cust" -DartifactId="$scope" )
+  # Tell the vRealize Developer Tools extension which Maven profile this project uses
+  local first="" prof
+  first="$(ls "$PROFILE_DIR" 2>/dev/null | sed -n 's/\.env$//p' | head -1)"
+  if [ -n "${PROFILE:-$first}" ]; then
+    ask PROFILE "Maven profile for VS Code (vrdev.maven.profile)" "${PROFILE:-$first}"
+    prof="$PROFILE"
+    mkdir -p "$dir/$scope/.vscode"
+    F="$dir/$scope/.vscode/settings.json" P="$prof" node -e '
+      const fs=require("fs"); const f=process.env.F; let o={};
+      try { o=JSON.parse(fs.readFileSync(f,"utf8")); } catch(e) {}
+      o["vrdev.maven.profile"]=process.env.P;
+      fs.writeFileSync(f, JSON.stringify(o,null,4)+"\n");'
+    skip "VS Code: vrdev.maven.profile = $prof"
+  else
+    warn "No connection profile yet - after add-profile, set vrdev.maven.profile in $dir/$scope/.vscode/settings.json"
+  fi
   log "Created $dir/$scope"
 }
 

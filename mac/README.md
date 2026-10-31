@@ -106,7 +106,9 @@ The account needs rights to the VCFA project (org/project admin) and to write co
 | Type | `ts` TypeScript vRO · `js` ES5 actions · `xml` workflows · `mixed` · `vra` VCFA VM Apps |
 
 Projects are created in `~/BuildTools/<CUST>/<scope>` (override with `PROJECT_ROOT=/path`).
-Non-interactive: `CUST=LAB SCOPE=bttest PTYPE=ts ./bt-setup.sh new-project`.
+Non-interactive: `CUST=LAB SCOPE=bttest PTYPE=ts PROFILE=lab-vcfa ./bt-setup.sh new-project`.
+`PROFILE` is written to the project's `.vscode/settings.json` as `vrdev.maven.profile`, which the
+vRealize Developer Tools extension needs for its Explorer and for pull/push from VS Code.
 
 ---
 
@@ -285,6 +287,7 @@ Then run the workflow / action in Orchestrator and check the logs.
 | SSL / PKIX errors on push | Lab: profile with "ignore self-signed certs = true". Production: import the CA into the JDK `cacerts` |
 | 401 on push to VCFA 9 | Username must be `user@<vm-apps-org>`; re-enter with `./bt-setup.sh refresh-token <id>` |
 | `.command` won't open ("unidentified developer") | Right-click → Open once, or run it from Terminal |
+| VS Code: "There is no currently active maven profile. Set the 'vrdev.maven.profile' setting" (Explorer empty, pull fails) | Add `{"vrdev.maven.profile": "<profile-id>"}` to the project's `.vscode/settings.json` (`new-project` now does this), then reload the window |
 | Need full Maven output | `mvn -e -X …` ; the self-test saves `bt-verify-mvn.log` next to itself |
 
 ## Files this touches
