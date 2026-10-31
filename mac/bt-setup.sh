@@ -446,7 +446,7 @@ cmd_add_profile() {
   render_settings
   log "Done. Push from a project folder with:"
   skip "vRO (js/ts/xml/mixed):  mvn clean package vrealize:push -DincludeDependencies=true -P$P_ID"
-  skip "vRA / VM Apps:          mvn clean package vra-ng:push -P$P_ID"
+  skip "vRA / VM Apps:          mvn clean package vrealize:push -P$P_ID"
 }
 
 cmd_refresh_token() {

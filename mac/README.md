@@ -141,12 +141,18 @@ mvn vrealize:clean -DincludeDependencies=true -DcleanUpOldVersions=true -DcleanU
 ### VCF Automation VM Apps projects (`vra`)
 
 ```bash
-mvn clean package vra-ng:push -Plab-vcfa
+mvn clean package vrealize:push -Plab-vcfa
 mvn vra-ng:pull -Plab-vcfa                                     # pull content from the project into ./src
-mvn clean package vra-ng:push -Plab-vcfa -Dvrang.data.collection.delay.seconds=600   # if content uses vRO workflows
+mvn clean package vrealize:push -Plab-vcfa -Dvrang.data.collection.delay.seconds=600   # if content uses vRO workflows
 ```
 
-Everything under `./src` is pushed to the project/org in the profile. One Maven project = one VCFA project + org;
+> The `vra-ng` plugin only has `package` and `pull` goals – pushing VM Apps projects uses the same
+> `vrealize:push` goal as vRO projects (some docs pages still show `vra-ng:push`, which fails with
+> "Could not find goal 'push'").
+
+The archetype generates sample content (a `Small VM` blueprint, `vra8-db-mssql` policies, a subscription,
+a catalog item, a content source…). **Everything under `./src` is pushed**, so move what you don't want
+out of `src` (e.g. to `samples/`) before the first push. Content goes to the project/org in the profile. One Maven project = one VCFA project + org;
 for another project, create another Maven project (or another profile with a different `vrang.project.name`).
 
 ### Where to see the result
