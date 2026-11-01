@@ -50,6 +50,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 # ------------------------------------------------------------------ paths ---
 $BtHome       = Join-Path $env:USERPROFILE '.buildtools'
 $ToolsDir     = Join-Path $BtHome 'tools'
+$DownloadDir  = Join-Path $BtHome 'downloads'   # not %TEMP%: it can be an 8.3 short path (C:\Users\ABC~1.XYZ)
 $ProfileDir   = Join-Path $BtHome 'profiles'
 $CertDir      = Join-Path $BtHome 'certs'
 $PackagingCfg = Join-Path $BtHome 'packaging.json'
@@ -140,16 +141,26 @@ function Write-Utf8NoBom([string]$path, [string]$text) {
 }
 
 function Download([string]$url, [string]$out) {
+  Ensure-Dir (Split-Path $out)
   Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
 }
 
-function Get-Hash([string]$path, [string]$algo) { return (Get-FileHash -Path $path -Algorithm $algo).Hash.ToLower() }
+function Get-Hash([string]$path, [string]$algo) { return (Get-FileHash -LiteralPath $path -Algorithm $algo).Hash.ToLower() }
 
 function Expand-Zip([string]$zip, [string]$dest) {
-  # ZipFile is much faster than Expand-Archive on 5.1 (the JDK has thousands of files)
+  # ZipFile is much faster than Expand-Archive on 5.1 (the JDK has thousands of files).
+  # Extract into a scratch folder first, then move the top folder, so a failed run never
+  # leaves a half-extracted tool behind that a re-run would mistake for an installed one.
   Ensure-Dir $dest
   Add-Type -AssemblyName System.IO.Compression.FileSystem
-  [IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
+  $scratch = Join-Path $DownloadDir ('x-' + [IO.Path]::GetRandomFileName())
+  [IO.Compression.ZipFile]::ExtractToDirectory($zip, $scratch)
+  foreach ($d in (Get-ChildItem -LiteralPath $scratch)) {
+    $target = Join-Path $dest $d.Name
+    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+    Move-Item -LiteralPath $d.FullName -Destination $target
+  }
+  Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Add-UserPath([string[]]$dirs) {
@@ -237,11 +248,11 @@ function Install-Jdk {
   $pkg = $null
   foreach ($as in @($assets)) { if ($as.binary.package.name -like '*.zip') { $pkg = $as.binary.package; break } }
   if (-not $pkg) { Die "No Temurin $JdkMajor zip found for windows/$a" }
-  $zip = Join-Path $env:TEMP $pkg.name
+  $zip = Join-Path $DownloadDir $pkg.name
   Download $pkg.link $zip
-  if ((Get-Hash $zip 'SHA256') -ne $pkg.checksum.ToLower()) { Remove-Item $zip -Force; Die 'JDK checksum mismatch - not installing.' }
+  if ((Get-Hash $zip 'SHA256') -ne $pkg.checksum.ToLower()) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; Die 'JDK checksum mismatch - not installing.' }
   Expand-Zip $zip $ToolsDir
-  Remove-Item $zip -Force
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
   Skip "installed $($pkg.name) (checksum verified)"
 }
 
@@ -254,11 +265,11 @@ function Install-Node {
   if (-not $line) { Die "No Node $NodeMajor zip found for win-$Arch" }
   $parts = $line.Trim() -split '\s+'
   $want = $parts[0].ToLower(); $name = $parts[1]
-  $zip = Join-Path $env:TEMP $name
+  $zip = Join-Path $DownloadDir $name
   Download "$base/$name" $zip
-  if ((Get-Hash $zip 'SHA256') -ne $want) { Remove-Item $zip -Force; Die 'Node checksum mismatch - not installing.' }
+  if ((Get-Hash $zip 'SHA256') -ne $want) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; Die 'Node checksum mismatch - not installing.' }
   Expand-Zip $zip $ToolsDir
-  Remove-Item $zip -Force
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
   Skip "installed $name (checksum verified)"
 }
 
@@ -266,7 +277,7 @@ function Install-Maven {
   Log "Apache Maven $MavenVersion ($MavenHome)"
   if (Test-Path (Join-Path $MavenHome 'bin\mvn.cmd')) { Skip 'already installed'; return }
   $name = "apache-maven-$MavenVersion-bin.zip"
-  $zip = Join-Path $env:TEMP $name
+  $zip = Join-Path $DownloadDir $name
   $ok = $false
   foreach ($base in @("https://dlcdn.apache.org/maven/maven-3/$MavenVersion/binaries",
                       "https://archive.apache.org/dist/maven/maven-3/$MavenVersion/binaries")) {
@@ -277,9 +288,9 @@ function Install-Maven {
     } catch { }
   }
   if (-not $ok) { Die "Could not download Maven $MavenVersion from apache.org" }
-  if ((Get-Hash $zip 'SHA512') -ne $want) { Remove-Item $zip -Force; Die 'Maven checksum mismatch - not installing.' }
+  if ((Get-Hash $zip 'SHA512') -ne $want) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; Die 'Maven checksum mismatch - not installing.' }
   Expand-Zip $zip $ToolsDir
-  Remove-Item $zip -Force
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
   Skip 'installed (checksum verified)'
 }
 
@@ -388,7 +399,7 @@ CN = $cn
     Invoke-Native $openssl @('pkcs12', '-export', '-name', 'BuildTools-Signing', '-out', 'certificate.pfx', '-inkey', 'private_key.key', '-in', 'certificate.crt', '-passout', 'env:BT_KEYPASS')
     Invoke-Native $openssl @('pkcs12', '-in', 'certificate.pfx', '-nocerts', '-passin', 'env:BT_KEYPASS', '-passout', 'env:BT_KEYPASS', '-out', 'private_key.pem')
     Invoke-Native $openssl @('pkcs12', '-in', 'certificate.pfx', '-nokeys', '-clcerts', '-passin', 'env:BT_KEYPASS', '-out', 'certificate.pem')
-    Remove-Item 'private_key.key' -Force
+    Remove-Item -LiteralPath 'private_key.key' -Force
   } finally { Remove-Item env:BT_KEYPASS -ErrorAction SilentlyContinue; Pop-Location }
   Write-Utf8NoBom $PackagingCfg (@{ keyPass = (Protect $keyPass) } | ConvertTo-Json)
   Skip "created (CN = $cn); key password is DPAPI-encrypted in $PackagingCfg"
@@ -651,7 +662,7 @@ function Cmd-SelfTest {
   Load-Env
   Log 'Self-test: scaffold, build and sign a throwaway project'
   $root = Join-Path $BtHome 'selftest'
-  if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+  if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
   Ensure-Dir $root
   $script:Cust = 'SELF'; $script:Scope = 'buildtest'; $script:ProjectType = 'js'; $script:ProjectRoot = $root; $script:MavenProfile = 'packaging'
   Cmd-NewProject
@@ -665,7 +676,7 @@ function Cmd-SelfTest {
   $pkg = Get-ChildItem $dir -Recurse -Filter '*.package' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'com.self.*' } | Select-Object -First 1
   if ($rc -eq 0 -and $pkg) {
     Skip "built $($pkg.Name) ($($pkg.Length) bytes)"
-    Remove-Item $root -Recurse -Force
+    Remove-Item -LiteralPath $root -Recurse -Force
     Log 'Self-test passed - BUILD SUCCESS'
   } else {
     Select-String -Path $log -Pattern 'ERROR|npm err' | Select-Object -First 30 | ForEach-Object { Write-Host "    $($_.Line)" }
