@@ -17,6 +17,8 @@ One PowerShell script that sets up a Windows 10/11 workstation for
 
 ---
 
+> After installing, continue with **[Getting started](../docs/getting-started.md)**: VS Code setup, your first push, all project types and where to find pushed content.
+
 ## 1. Install the toolchain
 
 ```powershell

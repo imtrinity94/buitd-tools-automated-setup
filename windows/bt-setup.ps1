@@ -730,6 +730,28 @@ function Cmd-Install {
     if (-not $a -or $a -match '^[Yy]') { Cmd-AddProfile }
   }
   Log 'All set. Open a NEW terminal so JAVA_HOME / PATH apply (this window is already updated).'
+  Print-NextSteps
+}
+
+function Print-NextSteps {
+  Write-Host @'
+
+Next steps
+  1. Check:        .\bt-setup.ps1 doctor            (Java 21, Maven 3.9.x, Node 22, profiles reachable)
+  2. Target:       .\bt-setup.ps1 add-profile       (vcfa9 = VCF Automation 9 VM Apps, vra8 = Aria Automation 8)
+  3. Project:      .\bt-setup.ps1 new-project -Cust LAB -Scope demo -ProjectType ts -MavenProfile <profile-id>
+                   -ProjectType: js | xml | mixed | ts | vra
+  4. VS Code:      File > Open Folder > the project folder (the one with pom.xml).
+                   The status bar (bottom left) must show the Maven profile; new-project sets it in
+                   .vscode\settings.json (vrdev.maven.profile). Reload the window after changing it.
+  5. Push:         cd $env:USERPROFILE\BuildTools\LAB\demo; mvn clean package vrealize:push -P<profile-id>
+                   (VM Apps projects use vrealize:push too; move archetype samples out of src first.
+                    Quote -D options that contain dots in PowerShell: "-Dvro.importOldVersions=true")
+  6. Look:         Orchestrator: Assets > Packages, Library > Actions / Workflows
+                   VCF Automation: the cloud templates etc. of the project in the profile
+
+  Full guide: https://github.com/imtrinity94/buitd-tools-automated-setup/blob/main/docs/getting-started.md
+'@
 }
 
 function Usage {

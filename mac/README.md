@@ -14,6 +14,8 @@ Everything is re-runnable – steps that are already done are skipped.
 
 ---
 
+> After installing, continue with **[Getting started](../docs/getting-started.md)**: VS Code setup, your first push, all project types and where to find pushed content.
+
 ## 1. Install the toolchain
 
 Prerequisite: [Homebrew](https://brew.sh) (the script finds it in `/opt/homebrew`, `/usr/local` or `~/.homebrew`).

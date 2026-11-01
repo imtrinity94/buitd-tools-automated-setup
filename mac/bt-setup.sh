@@ -540,6 +540,26 @@ cmd_doctor() {
   done
 }
 
+print_next_steps() {
+  cat <<'NEXT'
+
+Next steps
+  1. Check:        ./bt-setup.sh doctor            (Java 21, Maven 3.9.x, Node 22, profiles reachable)
+  2. Target:       ./bt-setup.sh add-profile       (vcfa9 = VCF Automation 9 VM Apps, vra8 = Aria Automation 8)
+  3. Project:      CUST=LAB SCOPE=demo PTYPE=ts PROFILE=<profile-id> ./bt-setup.sh new-project
+                   PTYPE: js | xml | mixed | ts | vra
+  4. VS Code:      File > Open Folder > the project folder (the one with pom.xml).
+                   The status bar (bottom left) must show the Maven profile; new-project sets it in
+                   .vscode/settings.json (vrdev.maven.profile). Reload the window after changing it.
+  5. Push:         cd ~/BuildTools/LAB/demo && mvn clean package vrealize:push -P<profile-id>
+                   (VM Apps projects use vrealize:push too; move archetype samples out of src first)
+  6. Look:         Orchestrator: Assets > Packages, Library > Actions / Workflows
+                   VCF Automation: the cloud templates etc. of the project in the profile
+
+  Full guide: https://github.com/imtrinity94/buitd-tools-automated-setup/blob/main/docs/getting-started.md
+NEXT
+}
+
 # ----------------------------------------------------------------- install ---
 cmd_install() {
   require_macos
@@ -555,6 +575,7 @@ cmd_install() {
     cmd_add_profile
   fi
   log "All set. Open a NEW terminal (or run: source ~/.zprofile) so JAVA_HOME/PATH apply."
+  print_next_steps
 }
 
 usage() { sed -n "2,21p" "$0" | sed 's/^# \{0,1\}//'; }
