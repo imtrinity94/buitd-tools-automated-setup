@@ -6,9 +6,10 @@ Tested on Apple Silicon, macOS 26, with Build Tools 4.25.1 and VCF Automation 9 
 
 | File | What it is |
 |---|---|
-| `bt-setup.sh` | The script: `install`, `add-profile`, `refresh-token`, `new-project`, `doctor` |
+| `bt-setup.sh` | The script: `install`, `add-profile`, `refresh-token`, `new-project`, `doctor`, `uninstall` |
 | `bt-install.command` | Double-click launcher for `bt-setup.sh install` (logs to `bt-setup.log`) |
 | `bt-verify.command` | Double-click self-test: scaffolds a throwaway project, builds and signs it, deletes it |
+| `bt-uninstall.command` | Double-click launcher for `bt-setup.sh uninstall` (shows the plan, asks first; logs to `bt-uninstall.log`) |
 
 Everything is re-runnable – steps that are already done are skipped.
 
@@ -292,6 +293,34 @@ Then run the workflow / action in Orchestrator and check the logs.
 | VS Code: "There is no currently active maven profile. Set the 'vrdev.maven.profile' setting" (Explorer empty, pull fails) | Add `{"vrdev.maven.profile": "<profile-id>"}` to the project's `.vscode/settings.json` (`new-project` now does this), then reload the window |
 | Need full Maven output | `mvn -e -X …` ; the self-test saves `bt-verify-mvn.log` next to itself |
 
+## Remove it again
+
+```bash
+./bt-setup.sh uninstall --dry-run     # only show what would be removed
+./bt-setup.sh uninstall               # show the plan, ask, then remove   (or double-click bt-uninstall.command)
+```
+
+It only removes what the script created, and asks once before doing anything:
+
+| Removed | Notes |
+|---|---|
+| `~/.buildtools` | Maven 3.9.16, signing certificate, profiles, npm cache |
+| `~/.zprofile` block | only the lines between the `build-tools-for-aria` markers (backup: `~/.zprofile.bak-bt-uninstall`) |
+| `~/.m2/settings.xml` | only if this script wrote it; the `settings.xml` you had before the first install is put back |
+| `~/.m2/settings-security.xml` | only if the install record shows this script created it |
+| `~/.m2/repository/com/vmware/pscoe` | Build Tools' own Maven artifacts (downloaded again if you reinstall) |
+| VS Code | the vRealize Developer Tools extension and the `vrdev.buildTools.defaultVersion` setting |
+
+Before that it saves your certs, profiles and Maven settings to `~/bt-uninstall-backup-<date>.tar.gz`
+(mode 600; it contains passwords, so keep it safe or delete it; `--no-backup` skips it).
+
+**Kept:** your projects in `~/BuildTools`, Homebrew, the rest of `~/.m2/repository`, `~/.npm`, and this folder.
+`openjdk@21`, `node@22`, `openssl@3` and VS Code are removed only with `--remove-shared`, and only if this
+script installed them and no other Homebrew package still needs them. Add `--yes` to skip the question.
+
+Installs made before the uninstall command existed have no install record, so the uninstall keeps those
+shared tools and `settings-security.xml`. It names them under "Kept" so you can remove them by hand.
+
 ## Files this touches
 
 ```
@@ -300,4 +329,5 @@ Then run the workflow / action in Orchestrator and check the logs.
 ~/.m2/settings-security.xml
 ~/.buildtools/                      maven, certs, profiles, npm-cache, selftest
 ~/Library/Application Support/Code/User/settings.json   vrdev.buildTools.defaultVersion
+~/.buildtools/install-manifest      what install created (used by uninstall)
 ```

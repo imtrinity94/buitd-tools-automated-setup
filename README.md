@@ -19,6 +19,12 @@ and push vRO (JavaScript / TypeScript) and VCF Automation VM Apps projects.
 | Create a project | `./bt-setup.sh new-project` | `.\bt-setup.ps1 new-project` |
 | Check everything | `./bt-setup.sh doctor` | `.\bt-setup.ps1 doctor` |
 | Push (in the project folder) | `mvn clean package vrealize:push -P<profile>` | same |
+| Remove it all again | `./bt-setup.sh uninstall` | `.\bt-setup.ps1 uninstall` |
+
+`uninstall` lists everything it will remove and asks first (add `--dry-run` / `-DryRun` to only look).
+It backs up your signing certificate and profiles, puts back the `settings.xml` you had before, and
+never touches your projects. JDK, Node, Git and VS Code are kept unless the script installed them
+**and** you add `--remove-shared` / `-RemoveShared`. See [CHANGELOG](CHANGELOG.md) for what changed.
 
 **Next: [Getting started](docs/getting-started.md)** – setting up VS Code, pushing your first project, what each
 project type (JS, XML, mixed, TypeScript, VM Apps) gives you, and where to find the pushed content in

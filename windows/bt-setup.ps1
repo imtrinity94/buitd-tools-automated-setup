@@ -12,6 +12,13 @@
     new-project             Scaffold a Build Tools project from an archetype
     selftest                Scaffold, build and sign a throwaway project (no server needed)
     doctor                  Show versions, files, profiles and host reachability
+    uninstall               Remove what install / add-profile created. Shows the plan and asks
+                            first. Options:
+                              -DryRun        only show what would be removed
+                              -Yes           don't ask (for scripts)
+                              -RemoveShared  also uninstall Git / VS Code, but only if this
+                                             script installed them (winget)
+                              -NoBackup      skip the backup of certs, profiles and settings
 
   Run it with:
     powershell -ExecutionPolicy Bypass -File .\bt-setup.ps1 install
@@ -39,7 +46,9 @@ param(
   [string]$MavenVersion = '3.9.16',
   [string]$JdkMajor = '21',
   [string]$NodeMajor = '22',
-  [switch]$SkipProfilePrompt
+  [switch]$SkipProfilePrompt,
+  # uninstall
+  [switch]$DryRun, [switch]$Yes, [switch]$RemoveShared, [switch]$NoBackup
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +72,8 @@ $ArchetypeGroup = 'com.vmware.pscoe.o11n.archetypes'
 $VsCodeExt    = 'vmware-pscoe.vrealize-developer-tools'
 $VsCodeUserSettings = Join-Path $env:APPDATA 'Code\User\settings.json'
 $MavenHome    = Join-Path $ToolsDir "apache-maven-$MavenVersion"
+$Manifest     = Join-Path $BtHome 'install-manifest.txt'   # what install created, so uninstall removes only that
+$PscoeRepo    = Join-Path $M2 'repository\com\vmware\pscoe'
 $Arch = 'x64'
 if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $Arch = 'arm64' }
 
@@ -163,15 +174,74 @@ function Expand-Zip([string]$zip, [string]$dest) {
   Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---- install record (read once into memory, so uninstall still has it after ~\.buildtools is gone)
+$script:ManifestLines = $null
+function Manifest-Lines {
+  if ($null -eq $script:ManifestLines) {
+    $script:ManifestLines = @()
+    if (Test-Path -LiteralPath $Manifest) {
+      $script:ManifestLines = @([IO.File]::ReadAllLines($Manifest, (New-Object Text.UTF8Encoding($false))))
+    }
+  }
+  return $script:ManifestLines
+}
+function Manifest-Has([string]$e) { return (@(Manifest-Lines) -contains $e) }
+function Manifest-Value([string]$prefix) {
+  foreach ($l in @(Manifest-Lines)) { if ($l.StartsWith($prefix)) { return $l.Substring($prefix.Length) } }
+  return $null
+}
+function Manifest-Add([string]$e) {
+  if (Manifest-Has $e) { return }
+  Ensure-Dir $BtHome
+  [IO.File]::AppendAllText($Manifest, "$e`r`n", (New-Object Text.UTF8Encoding($false)))
+  $script:ManifestLines = @(@(Manifest-Lines) + $e)
+}
+
+function Under-Dir([string]$path, [string]$dir) {
+  if (-not $path) { return $false }
+  return $path.TrimEnd('\').StartsWith($dir.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+}
+
+# ---- user environment, read/written raw so %VARS% in PATH stay unexpanded (REG_EXPAND_SZ)
+function Get-UserEnvRaw([string]$name) {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+  if (-not $k) { return '' }
+  try { return [string]$k.GetValue($name, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+  finally { $k.Close() }
+}
+function Set-UserEnvRaw([string]$name, [string]$value) {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+  try {
+    if (-not $value) { $k.DeleteValue($name, $false) }
+    else {
+      $kind = [Microsoft.Win32.RegistryValueKind]::String
+      if ($value -match '%[^%;]+%') { $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString }
+      $k.SetValue($name, $value, $kind)
+    }
+  } finally { $k.Close() }
+  Send-EnvChange
+}
+function Send-EnvChange {
+  # WM_SETTINGCHANGE, so new terminals started from Explorer see the change
+  try {
+    if (-not ('BtSetup.EnvNotify' -as [type])) {
+      Add-Type -Namespace BtSetup -Name EnvNotify -MemberDefinition @'
+[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+'@
+    }
+    $r = [UIntPtr]::Zero
+    [void][BtSetup.EnvNotify]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$r)
+  } catch { }
+}
+
 function Add-UserPath([string[]]$dirs) {
-  $cur = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (-not $cur) { $cur = '' }
-  $parts = @($cur -split ';' | Where-Object { $_ -and ($dirs -notcontains $_) })
-  # drop older copies managed by this script (other versions under .buildtools\tools)
-  $parts = @($parts | Where-Object { $_ -notlike "$ToolsDir*" })
+  $cur = Get-UserEnvRaw 'Path'
+  # drop these dirs and older copies managed by this script (other versions under .buildtools\tools)
+  $parts = @($cur -split ';' | Where-Object { $_ -and ($dirs -notcontains $_) -and -not (Under-Dir $_ $ToolsDir) })
   $new = (@($dirs) + $parts) -join ';'
   if ($new -ne $cur) {
-    [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+    Set-UserEnvRaw 'Path' $new
     Skip 'user PATH updated'
   } else { Skip 'user PATH already up to date' }
   # current session too
@@ -303,6 +373,7 @@ function Install-Git {
     Quiet { & winget.exe install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements }
   }
   if (-not (Find-OpenSsl)) { Die 'Git installed but openssl.exe still not found - open a new terminal and re-run.' }
+  Manifest-Add 'winget:Git.Git'
   Skip "openssl: $(Find-OpenSsl)"
 }
 
@@ -311,15 +382,18 @@ function Install-VsCode {
   if (Find-Code) { Skip "already installed ($(Find-Code))"; return }
   if (-not (Has-Winget)) { Warn 'VS Code not found and winget is not available - install it from https://code.visualstudio.com, then re-run.'; return }
   Quiet { & winget.exe install --id Microsoft.VisualStudioCode -e --scope user --silent --accept-package-agreements --accept-source-agreements }
-  if (Find-Code) { Skip 'installed' } else { Warn 'VS Code install did not finish - re-run later.' }
+  if (Find-Code) { Skip 'installed'; Manifest-Add 'winget:Microsoft.VisualStudioCode' } else { Warn 'VS Code install did not finish - re-run later.' }
 }
 
 function Set-UserEnv {
   Log 'User environment variables'
   $jdk = Jdk-Home; $node = Node-Home
   if (-not $jdk -or -not $node) { Die 'JDK or Node missing - run install again.' }
-  if ([Environment]::GetEnvironmentVariable('JAVA_HOME', 'User') -ne $jdk) {
-    [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdk, 'User'); Skip "JAVA_HOME = $jdk"
+  $oldJh = Get-UserEnvRaw 'JAVA_HOME'
+  if ($oldJh -ne $jdk) {
+    # remember a JAVA_HOME you had before, so uninstall can put it back
+    if ($oldJh -and -not (Under-Dir $oldJh $ToolsDir) -and -not (Manifest-Value 'prev-java-home:')) { Manifest-Add "prev-java-home:$oldJh" }
+    Set-UserEnvRaw 'JAVA_HOME' $jdk; Skip "JAVA_HOME = $jdk"
   } else { Skip 'JAVA_HOME already set' }
   Add-UserPath @((Join-Path $MavenHome 'bin'), (Join-Path $jdk 'bin'), $node)
   # npm cache: the default (%LOCALAPPDATA%\npm-cache) is fine on Windows; nothing to change.
@@ -343,7 +417,7 @@ function Setup-VsCodeExt {
   if ($list -contains $VsCodeExt) { Skip 'already installed' }
   else {
     Quiet { & $code --install-extension $VsCodeExt 2>&1 | Out-Null }
-    if (@(Quiet { & $code --list-extensions 2>$null }) -contains $VsCodeExt) { Skip "installed $VsCodeExt" }
+    if (@(Quiet { & $code --list-extensions 2>$null }) -contains $VsCodeExt) { Skip "installed $VsCodeExt"; Manifest-Add 'vscode-ext' }
     else { Die "Could not install VS Code extension $VsCodeExt" }
   }
   $ver = Resolve-BtVersion
@@ -415,6 +489,7 @@ function Setup-MasterPassword {
   if (-not $enc) { Warn 'mvn --encrypt-master-password failed - skipping'; return }
   $val = $enc.Matches[0].Value
   Write-Utf8NoBom $SettingsSec "<settingsSecurity>`r`n  <master>$val</master>`r`n</settingsSecurity>`r`n"
+  Manifest-Add 'm2-security'
   Skip 'created (random master password)'
 }
 
@@ -475,6 +550,7 @@ function Render-Settings {
   if ((Test-Path $SettingsXml) -and -not (Select-String -Path $SettingsXml -Pattern $SettingsMark -SimpleMatch -Quiet)) {
     $bak = "$SettingsXml.bak-$(Get-Date -Format yyyyMMddHHmmss)"
     Copy-Item $SettingsXml $bak
+    Manifest-Add "settings-backup:$bak"
     Warn "Existing settings.xml was not created by this script - backed up to $bak"
     Warn 'Mirrors / servers / proxies in it are NOT carried over; copy them back in if you need them.'
   }
@@ -733,6 +809,197 @@ function Cmd-Install {
   Print-NextSteps
 }
 
+# -------------------------------------------------------------- uninstall ---
+# Two passes over the same steps: 'plan' only lists them, 'run' does them.
+$script:UMode = 'plan'; $script:UCount = 0; $script:UFailed = 0
+$script:UKept = New-Object System.Collections.ArrayList
+$script:UBackup = ''
+
+function UStep([string]$__what, [scriptblock]$__do) {
+  $script:UCount++
+  if ($script:UMode -eq 'plan') { Write-Host "    - $__what"; return }
+  Log $__what
+  try { & $__do }
+  catch { Warn "Failed: $__what - $($_.Exception.Message). Carrying on with the rest."; $script:UFailed++ }
+}
+function UKeep([string]$m) { if ($script:UMode -eq 'plan') { [void]$script:UKept.Add($m) } }
+function Tilde([string]$p) {
+  if (Under-Dir $p $env:USERPROFILE) { return '~' + $p.Substring($env:USERPROFILE.TrimEnd('\').Length) }
+  return $p
+}
+
+function Dir-Size([string]$p) {
+  $b = (Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+  if (-not $b) { return '0 MB' }
+  return ('{0:N0} MB' -f ($b / 1MB))
+}
+
+function Remove-Tree([string]$p) {
+  if (-not (Test-Path -LiteralPath $p)) { return }
+  try { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop }
+  catch {
+    $err = $_.Exception.Message
+    # node_modules can go past the 260-character limit of Windows PowerShell 5.1
+    Quiet { & cmd.exe /c rd /s /q "\\?\$p" 2>&1 | Out-Null }
+    if (Test-Path -LiteralPath $p) { throw "could not delete $p ($err)" }
+  }
+}
+
+function Original-Settings {
+  # the settings.xml you had before the first install, if install backed it up
+  $b = Manifest-Value 'settings-backup:'
+  if ($b -and (Test-Path -LiteralPath $b)) { return $b }
+  $c = Get-ChildItem -Path $M2 -Filter 'settings.xml.bak-*' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
+  if ($c) { return $c.FullName }
+  return $null
+}
+
+function U-Backup {
+  $items = @($CertDir, $ProfileDir, $PackagingCfg, $SettingsXml, $SettingsSec | Where-Object { Test-Path -LiteralPath $_ })
+  Compress-Archive -LiteralPath $items -DestinationPath $script:UBackup -Force
+  Restrict-ToUser $script:UBackup
+  Skip "saved $(Tilde $script:UBackup)"
+}
+
+function U-VsCodeSetting {
+  $obj = Get-Content -LiteralPath $VsCodeUserSettings -Raw | ConvertFrom-Json
+  $obj.PSObject.Properties.Remove('vrdev.buildTools.defaultVersion')
+  Write-Utf8NoBom $VsCodeUserSettings ($obj | ConvertTo-Json -Depth 20)
+}
+
+function U-UserEnv {
+  $cur = Get-UserEnvRaw 'Path'
+  $new = (@($cur -split ';' | Where-Object { $_ -and -not (Under-Dir $_ $ToolsDir) })) -join ';'
+  if ($new -ne $cur) { Set-UserEnvRaw 'Path' $new; Skip 'removed .buildtools\tools entries from user PATH' }
+  $jh = Get-UserEnvRaw 'JAVA_HOME'
+  if (Under-Dir $jh $ToolsDir) {
+    $prev = Manifest-Value 'prev-java-home:'
+    if ($prev) { Set-UserEnvRaw 'JAVA_HOME' $prev; Skip "JAVA_HOME put back to $prev" }
+    else { Set-UserEnvRaw 'JAVA_HOME' ''; Skip 'JAVA_HOME removed' }
+  }
+  # this window too
+  $env:Path = (@($env:Path -split ';' | Where-Object { $_ -and -not (Under-Dir $_ $ToolsDir) })) -join ';'
+  if (Under-Dir $env:JAVA_HOME $ToolsDir) { Remove-Item env:JAVA_HOME -ErrorAction SilentlyContinue }
+}
+
+function U-Winget([string]$id) {
+  Quiet { & winget.exe uninstall --id $id -e --silent --accept-source-agreements }
+  if ($LASTEXITCODE -ne 0) { throw "winget uninstall $id exited with code $LASTEXITCODE" }
+}
+
+function U-Steps {
+  # 1. backup of what can't be re-created (signing key, profiles, Maven settings)
+  if (-not $NoBackup -and ((Test-Path $CertDir) -or (Test-Path $ProfileDir) -or (Test-Path $SettingsXml))) {
+    UStep "Back up certs, profiles and Maven settings to $(Tilde $script:UBackup) (it contains passwords: keep it safe or delete it)" { U-Backup }
+  }
+
+  # 2. VS Code
+  $code = Find-Code
+  if ($code -and (@(Quiet { & $code --list-extensions 2>$null }) -contains $VsCodeExt)) {
+    UStep "Uninstall VS Code extension $VsCodeExt" { Invoke-Native $code @('--uninstall-extension', $VsCodeExt) }
+  }
+  if ((Test-Path $VsCodeUserSettings) -and (Select-String -LiteralPath $VsCodeUserSettings -Pattern '"vrdev.buildTools.defaultVersion"' -SimpleMatch -Quiet)) {
+    $ok = $true
+    try { [void](Get-Content -LiteralPath $VsCodeUserSettings -Raw | ConvertFrom-Json) } catch { $ok = $false }
+    if ($ok) { UStep 'Remove vrdev.buildTools.defaultVersion from VS Code user settings' { U-VsCodeSetting } }
+    else { UKeep 'VS Code setting vrdev.buildTools.defaultVersion (settings.json has comments - remove it in Settings by hand)' }
+  }
+
+  # 3. Maven settings: only files this script wrote
+  $orig = $null
+  if ((Test-Path $SettingsXml) -and (Select-String -LiteralPath $SettingsXml -Pattern $SettingsMark -SimpleMatch -Quiet)) {
+    $orig = Original-Settings
+    if ($orig) { UStep "Put back your original ~\.m2\settings.xml (from $(Split-Path $orig -Leaf))" { Move-Item -LiteralPath $orig -Destination $SettingsXml -Force } }
+    else       { UStep 'Delete ~\.m2\settings.xml (written by this script)' { Remove-Item -LiteralPath $SettingsXml -Force } }
+  } elseif (Test-Path $SettingsXml) {
+    UKeep '~\.m2\settings.xml (not written by this script)'
+  }
+  if (Test-Path $SettingsSec) {
+    if (Manifest-Has 'm2-security') { UStep 'Delete ~\.m2\settings-security.xml (created by this script)' { Remove-Item -LiteralPath $SettingsSec -Force } }
+    else { UKeep '~\.m2\settings-security.xml (no record that this script created it; if it did, delete it yourself)' }
+  }
+  if (Test-Path $PscoeRepo) {
+    UStep "Delete Build Tools artifacts from the Maven cache: ~\.m2\repository\com\vmware\pscoe ($(Dir-Size $PscoeRepo), downloaded again when needed)" { Remove-Tree $PscoeRepo }
+  }
+
+  # 4. user environment variables
+  $pathHit = @((Get-UserEnvRaw 'Path') -split ';' | Where-Object { $_ -and (Under-Dir $_ $ToolsDir) }).Count -gt 0
+  $jhHit = Under-Dir (Get-UserEnvRaw 'JAVA_HOME') $ToolsDir
+  if ($pathHit -or $jhHit) {
+    $what = 'Remove the .buildtools\tools entries from your user PATH'
+    if ($jhHit) {
+      if (Manifest-Value 'prev-java-home:') { $what += " and put JAVA_HOME back to $(Manifest-Value 'prev-java-home:')" }
+      else { $what += ' and remove JAVA_HOME' }
+    }
+    UStep $what { U-UserEnv }
+  }
+
+  # 5. everything under ~\.buildtools (JDK, Node, Maven, certs, profiles)
+  if (Test-Path $BtHome) {
+    UStep "Delete ~\.buildtools ($(Dir-Size $BtHome): JDK $JdkMajor, Node $NodeMajor, Maven, signing cert, profiles)" { Remove-Tree $BtHome }
+  }
+
+  # 6. shared tools: only with -RemoveShared, and only what install itself installed
+  $shared = @(
+    @{ Id = 'Microsoft.VisualStudioCode'; Name = 'Visual Studio Code'; There = [bool](Find-Code); Note = 'your VS Code settings stay' },
+    @{ Id = 'Git.Git'; Name = 'Git for Windows'; There = [bool](Find-OpenSsl); Note = 'other tools may use Git too' }
+  )
+  foreach ($t in $shared) {
+    if (-not $t.There) { continue }
+    if (-not (Manifest-Has "winget:$($t.Id)")) { UKeep "$($t.Name) (no record that this script installed it)" }
+    elseif (-not $RemoveShared) { UKeep "$($t.Name) (installed by this script; add -RemoveShared to remove it)" }
+    else {
+      $sid = $t.Id
+      UStep "winget uninstall $($t.Name) (installed by this script; $($t.Note))" { U-Winget $sid }
+    }
+  }
+
+  # never touched
+  $projects = Join-Path $env:USERPROFILE 'BuildTools'
+  if (Test-Path $projects) {
+    $n = @(Get-ChildItem -LiteralPath $projects -Filter 'pom.xml' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue).Count
+    UKeep "~\BuildTools ($n project(s) - your code is never deleted)"
+  }
+  foreach ($b in @(Get-ChildItem -Path $M2 -Filter 'settings.xml.bak-*' -File -ErrorAction SilentlyContinue)) {
+    if ($b.FullName -ne $orig) { UKeep "$(Tilde $b.FullName) (old backup)" }
+  }
+  UKeep 'the rest of ~\.m2\repository, the npm cache (%LOCALAPPDATA%\npm-cache) and this repository folder'
+}
+
+function Cmd-Uninstall {
+  if (-not $env:USERPROFILE -or -not $BtHome.EndsWith('\.buildtools')) { Die "Unexpected tools folder '$BtHome' - not removing anything." }
+  if (Test-Path $BtHome) {
+    if (Under-Dir (Get-Location).ProviderPath $BtHome) { Die "You are inside $BtHome - cd somewhere else first." }
+    $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $pp = $null; try { $pp = $_.Path } catch { }; $pp -and (Under-Dir $pp $BtHome) })
+    if ($busy.Count -gt 0) {
+      Die "Still running from $BtHome : $(($busy | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', '). Stop Maven builds / close those windows first."
+    }
+    if (-not (Test-Path $Manifest)) { Warn 'No install record found (installed with an older version of this script): only files this script certainly owns are removed.' }
+  }
+  [void](Manifest-Lines)   # load it now; it lives in the folder that gets deleted
+  $script:UBackup = Join-Path $env:USERPROFILE "bt-uninstall-backup-$(Get-Date -Format yyyyMMddHHmmss).zip"
+
+  Log 'Uninstall plan'
+  $script:UMode = 'plan'; $script:UCount = 0
+  U-Steps
+  if ($script:UCount -eq 0) { Skip 'nothing to remove' }
+  if ($script:UKept.Count -gt 0) { Log 'Kept'; foreach ($k in $script:UKept) { Write-Host "    - $k" } }
+  if ($script:UCount -eq 0) { return }
+  if ($DryRun) { Log 'Dry run - nothing was changed.'; return }
+  if (-not $Yes) {
+    $a = Read-Host '    Remove the items above? [y/N]'
+    if ($a -notmatch '^[Yy]') { Log 'Nothing was changed.'; return }
+  }
+
+  $script:UMode = 'run'
+  U-Steps
+  if ($script:UFailed -gt 0) { Warn "$($script:UFailed) step(s) failed - see above. Fix them and run uninstall again." }
+  else { Log 'Build Tools setup removed.' }
+  Skip 'Open a NEW terminal: windows that were already open keep the old PATH / JAVA_HOME.'
+  if (Test-Path -LiteralPath $script:UBackup) { Skip "Backup: $(Tilde $script:UBackup)" }
+  Skip 'To set it up again later: .\bt-setup.ps1 install'
+}
+
 function Print-NextSteps {
   Write-Host @'
 
@@ -765,5 +1032,6 @@ switch ($Command.ToLower()) {
   'new-project'   { Cmd-NewProject }
   'selftest'      { Cmd-SelfTest }
   'doctor'        { Cmd-Doctor }
+  'uninstall'     { Cmd-Uninstall }
   default         { Usage }
 }

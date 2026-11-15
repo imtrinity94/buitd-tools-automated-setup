@@ -6,9 +6,10 @@ One PowerShell script that sets up a Windows 10/11 workstation for
 
 | File | What it is |
 |---|---|
-| `bt-setup.ps1` | The script: `install`, `add-profile`, `refresh-token`, `new-project`, `selftest`, `doctor` |
+| `bt-setup.ps1` | The script: `install`, `add-profile`, `refresh-token`, `new-project`, `selftest`, `doctor`, `uninstall` |
 | `bt-install.cmd` | Double-click launcher for `install` (logs to `bt-setup.log`) |
 | `bt-selftest.cmd` | Double-click: scaffolds a throwaway project, builds and signs it, deletes it |
+| `bt-uninstall.cmd` | Double-click launcher for `uninstall` (shows the plan, asks first; logs to `bt-uninstall.log`) |
 
 - Works in **Windows PowerShell 5.1** (built in) and PowerShell 7.
 - **No administrator rights needed.** JDK, Node and Maven are downloaded as zips into your profile and
@@ -148,6 +149,35 @@ everything there applies to Windows except the install steps.
 | Behind a corporate proxy | Proxy support isn't built in yet. Set `HTTPS_PROXY` for the downloads; `settings.xml` is regenerated on every run, so re-add your `<proxies>` section after `install` / `add-profile` |
 | Self-test fails | Full Maven output: `%USERPROFILE%\.buildtools\selftest-mvn.log` |
 
+## Remove it again
+
+```powershell
+.\bt-setup.ps1 uninstall -DryRun      # only show what would be removed
+.\bt-setup.ps1 uninstall              # show the plan, ask, then remove   (or double-click bt-uninstall.cmd)
+```
+
+It only removes what the script created, and asks once before doing anything:
+
+| Removed | Notes |
+|---|---|
+| `%USERPROFILE%\.buildtools` | JDK, Node, Maven, signing certificate, profiles |
+| User `PATH` / `JAVA_HOME` | only the `.buildtools\tools` entries; a `JAVA_HOME` you had before install is put back |
+| `%USERPROFILE%\.m2\settings.xml` | only if this script wrote it; the `settings.xml` you had before the first install is put back |
+| `%USERPROFILE%\.m2\settings-security.xml` | only if the install record shows this script created it |
+| `%USERPROFILE%\.m2\repository\com\vmware\pscoe` | Build Tools' own Maven artifacts (downloaded again if you reinstall) |
+| VS Code | the vRealize Developer Tools extension and the `vrdev.buildTools.defaultVersion` setting |
+
+Before that it saves your certs, profiles and Maven settings to `%USERPROFILE%\bt-uninstall-backup-<date>.zip`
+(readable only by you; it contains passwords, so keep it safe or delete it; `-NoBackup` skips it).
+Close VS Code and any terminal running a Maven build first. The script stops if something still runs from `.buildtools`.
+
+**Kept:** your projects in `%USERPROFILE%\BuildTools`, the rest of `.m2\repository`, the npm cache, and this folder.
+Git and VS Code are removed only with `-RemoveShared`, and only if this script installed them with `winget`.
+Add `-Yes` to skip the question.
+
+Installs made before the uninstall command existed have no install record. For those, the uninstall keeps
+Git, VS Code and `settings-security.xml`, and it can't restore a `JAVA_HOME` you had before the install.
+
 ## Files this touches
 
 ```
@@ -156,4 +186,5 @@ everything there applies to Windows except the install steps.
 %USERPROFILE%\.m2\settings-security.xml
 %APPDATA%\Code\User\settings.json   vrdev.buildTools.defaultVersion
 User environment                    JAVA_HOME, PATH
+%USERPROFILE%\.buildtools\install-manifest.txt   what install created (used by uninstall)
 ```

@@ -9,6 +9,13 @@
 #   refresh-token <id>      Re-fetch the refresh token for an existing profile
 #   new-project             Scaffold a Build Tools project from an archetype
 #   doctor                  Show versions, files, profiles and host reachability
+#   uninstall [options]     Remove what install / add-profile created (shows the
+#                           plan and asks first). Options:
+#                             --dry-run        only show what would be removed
+#                             --yes            don't ask (for scripts)
+#                             --remove-shared  also remove Homebrew packages / VS Code,
+#                                              but only those this script installed
+#                             --no-backup      skip the backup of certs and profiles
 #
 # Any prompt can be pre-answered with an environment variable, e.g.
 #   P_ID=lab-vcfa P_HOST=vcfa.vmw.lab ./bt-setup.sh add-profile
@@ -37,6 +44,8 @@ MAVEN_HOME="$BT_HOME/apache-maven-$MAVEN_VERSION"
 VSCODE_EXT="vmware-pscoe.vrealize-developer-tools"
 CENTRAL="https://repo1.maven.org/maven2"
 VSCODE_SETTINGS="$HOME/Library/Application Support/Code/User/settings.json"
+MANIFEST="$BT_HOME/install-manifest"   # what install created, so uninstall removes only that
+PSCOE_REPO="$M2/repository/com/vmware/pscoe"
 
 # ----------------------------------------------------------------- helpers ---
 c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_err=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
@@ -101,6 +110,13 @@ find_vscode_app() {
   return 1
 }
 
+manifest_add() { # record something install created (one line, no duplicates)
+  mkdir -p "$BT_HOME"
+  [ -f "$MANIFEST" ] && grep -qxF "$1" "$MANIFEST" && return 0
+  printf '%s\n' "$1" >> "$MANIFEST"
+}
+manifest_has() { [ -f "$MANIFEST" ] && grep -qxF "$1" "$MANIFEST"; }
+
 require_macos() { [ "$(uname -s)" = "Darwin" ] || die "This script is for macOS."; }
 
 ensure_brew() {
@@ -144,14 +160,14 @@ install_tools() {
   local f
   for f in openjdk@21 node@22 openssl@3; do
     if brew list --versions "$f" >/dev/null 2>&1; then skip "$f already installed"
-    else brew install "$f"; fi
+    else brew install "$f"; manifest_add "brew:$f"; fi
   done
   if find_vscode_app >/dev/null; then skip "VS Code already installed ($(find_vscode_app))"
-  elif [ -w /Applications ]; then brew install --cask visual-studio-code
+  elif [ -w /Applications ]; then brew install --cask visual-studio-code; manifest_add "cask:visual-studio-code"
   else
     mkdir -p "$HOME/Applications"
     skip "/Applications not writable - installing VS Code into ~/Applications"
-    brew install --cask --appdir="$HOME/Applications" visual-studio-code
+    brew install --cask --appdir="$HOME/Applications" visual-studio-code; manifest_add "cask:visual-studio-code"
   fi
 }
 
@@ -200,7 +216,7 @@ $MARK_END"
   awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0==b{s=1;next} $0==e{s=0;next} !s' "$ZPROFILE" > "$tmp"
   printf '%s\n' "$block" >> "$tmp"
   if cmp -s "$tmp" "$ZPROFILE"; then skip "already up to date"; rm -f "$tmp"
-  else cp "$ZPROFILE" "$ZPROFILE.bak-bt"; mv "$tmp" "$ZPROFILE"; skip "updated (backup: ~/.zprofile.bak-bt)"; fi
+  else cp "$ZPROFILE" "$ZPROFILE.bak-bt"; cat "$tmp" > "$ZPROFILE"; rm -f "$tmp"; skip "updated (backup: ~/.zprofile.bak-bt)"; fi
   load_env
 }
 
@@ -223,7 +239,7 @@ setup_vscode() {
   if "$code" --list-extensions 2>/dev/null | grep -qix "$VSCODE_EXT"; then skip "already installed"
   else
     local out
-    if out="$("$code" --install-extension "$VSCODE_EXT" 2>&1)"; then skip "installed $VSCODE_EXT"
+    if out="$("$code" --install-extension "$VSCODE_EXT" 2>&1)"; then skip "installed $VSCODE_EXT"; manifest_add "vscode-ext"
     else printf '%s\n' "$out" | grep -v -i deprecation >&2; die "Could not install VS Code extension $VSCODE_EXT"; fi
   fi
 
@@ -289,7 +305,7 @@ setup_master_password() {
   [ -n "$enc" ] || { warn "mvn --encrypt-master-password failed - skipping"; return; }
   umask 077
   printf '<settingsSecurity>\n  <master>%s</master>\n</settingsSecurity>\n' "$enc" > "$SETTINGS_SEC"
-  chmod 600 "$SETTINGS_SEC"; skip "created (random master password)"
+  chmod 600 "$SETTINGS_SEC"; manifest_add "m2-security"; skip "created (random master password)"
 }
 
 # ---------------------------------------------------------- settings.xml ---
@@ -342,6 +358,7 @@ render_settings() {
   if [ -f "$SETTINGS" ] && ! grep -q "$SETTINGS_MARK" "$SETTINGS"; then
     local bak; bak="$SETTINGS.bak-$(date +%Y%m%d%H%M%S)"
     cp "$SETTINGS" "$bak"
+    manifest_add "settings-backup:$bak"
     warn "Existing settings.xml was not created by this script - backed up to $bak"
     warn "Mirrors / servers / proxies in it are NOT carried over; copy them back in if you need them."
   fi
@@ -540,6 +557,227 @@ cmd_doctor() {
   done
 }
 
+# --------------------------------------------------------------- uninstall ---
+# Two passes over the same steps: "plan" only prints them, "run" does them.
+U_MODE=plan; U_COUNT=0; U_FAILED=0; U_KEPT=""; U_BREW_RM=" "
+U_DRY=""; U_YES=""; U_SHARED=""; U_NOBACKUP=""; U_BACKUP=""
+
+ustep() { # ustep "what" command [args...]
+  local d="$1"; shift
+  U_COUNT=$((U_COUNT + 1))
+  if [ "$U_MODE" = plan ]; then printf '    - %s\n' "$d"; return 0; fi
+  log "$d"
+  "$@" || { warn "Failed: $d - carrying on with the rest"; U_FAILED=$((U_FAILED + 1)); }
+}
+tildify() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+ukeep() { [ "$U_MODE" = plan ] && U_KEPT="$U_KEPT
+    - $1"; return 0; }
+
+u_load_env() { # PATH for node / code, without dying when Homebrew is already gone
+  local p
+  for p in "$(command -v brew 2>/dev/null || true)" "$HOME/.homebrew/bin/brew" /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [ -n "$p" ] && [ -x "$p" ] && { load_env; return 0; }
+  done
+  return 0
+}
+
+u_code_cli() {
+  local app code
+  app="$(find_vscode_app || true)"
+  code="$app/Contents/Resources/app/bin/code"
+  [ -n "$app" ] && [ -x "$code" ] || code="$(command -v code || true)"
+  [ -n "$code" ] && [ -x "$code" ] && echo "$code"
+  return 0
+}
+
+u_do_backup() { # paths inside the archive are relative to your home folder
+  local items="" i
+  for i in "$CERT_DIR" "$PROFILE_DIR" "$PACKAGING_ENV" "$SETTINGS" "$SETTINGS_SEC"; do
+    [ -e "$i" ] || continue
+    case "$i" in "$HOME"/*) i="${i#"$HOME"/}" ;; esac
+    items="$items
+$i"
+  done
+  ( umask 077; cd "$HOME"
+    printf '%s\n' "$items" | sed '/^$/d' | tr '\n' '\0' | xargs -0 tar -czf "$U_BACKUP" 2>/dev/null )
+  [ -s "$U_BACKUP" ] || return 1
+  chmod 600 "$U_BACKUP"; skip "saved $(tildify "$U_BACKUP")"
+}
+
+u_do_vscode_setting() {
+  F="$VSCODE_SETTINGS" node -e '
+    const fs=require("fs"); const f=process.env.F;
+    const o=JSON.parse(fs.readFileSync(f,"utf8")||"{}");
+    if (!("vrdev.buildTools.defaultVersion" in o)) process.exit(0);
+    delete o["vrdev.buildTools.defaultVersion"];
+    fs.writeFileSync(f, JSON.stringify(o,null,4)+"\n");'
+}
+
+u_original_settings() { # the settings.xml you had before the first install, if it was backed up
+  local b=""
+  [ -f "$MANIFEST" ] && b="$(sed -n 's/^settings-backup://p' "$MANIFEST" | head -1)"
+  if [ -n "$b" ] && [ -f "$b" ]; then echo "$b"; return 0; fi
+  ls -1 "$SETTINGS".bak-* 2>/dev/null | sort | head -1 || true
+  return 0
+}
+
+u_do_zprofile() {
+  local tmp; tmp="$(mktemp)"
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0==b{s=1;next} $0==e{s=0;next} !s' "$ZPROFILE" > "$tmp"
+  cp "$ZPROFILE" "$ZPROFILE.bak-bt-uninstall"
+  cat "$tmp" > "$ZPROFILE"     # write through, so a symlinked ~/.zprofile stays a symlink
+  rm -f "$tmp"
+}
+
+u_brew_deps() { # installed formulae that still need $1, ignoring ones this run removes
+  local d out=""
+  for d in $(brew uses --installed "$1" 2>/dev/null || true); do
+    case "$U_BREW_RM" in *" $d "*) ;; *) out="$out $d" ;; esac
+  done
+  echo "${out# }"
+}
+
+u_steps() {
+  local code="" orig="" f deps size n
+
+  # 1. backup of what can't be re-created (signing key, profiles, Maven settings)
+  if [ -z "$U_NOBACKUP" ] && { [ -d "$CERT_DIR" ] || [ -d "$PROFILE_DIR" ] || [ -f "$SETTINGS" ]; }; then
+    ustep "Back up certs, profiles and Maven settings to $(tildify "$U_BACKUP") (it contains passwords: keep it safe or delete it)" u_do_backup
+  fi
+
+  # 2. VS Code
+  code="$(u_code_cli)"
+  if [ -n "$code" ] && "$code" --list-extensions 2>/dev/null | grep -qix "$VSCODE_EXT"; then
+    ustep "Uninstall VS Code extension $VSCODE_EXT" "$code" --uninstall-extension "$VSCODE_EXT"
+  fi
+  if [ -f "$VSCODE_SETTINGS" ] && grep -q '"vrdev.buildTools.defaultVersion"' "$VSCODE_SETTINGS"; then
+    if command -v node >/dev/null 2>&1; then
+      ustep "Remove vrdev.buildTools.defaultVersion from VS Code user settings" u_do_vscode_setting
+    else
+      ukeep "VS Code setting vrdev.buildTools.defaultVersion (node not found - remove it in Settings by hand)"
+    fi
+  fi
+
+  # 3. Maven settings: only files this script wrote
+  if [ -f "$SETTINGS" ] && grep -q "$SETTINGS_MARK" "$SETTINGS"; then
+    orig="$(u_original_settings)"
+    if [ -n "$orig" ]; then
+      ustep "Put back your original ~/.m2/settings.xml (from $(basename "$orig"))" mv -f "$orig" "$SETTINGS"
+    else
+      ustep "Delete ~/.m2/settings.xml (written by this script)" rm -f "$SETTINGS"
+    fi
+  elif [ -f "$SETTINGS" ]; then
+    ukeep "~/.m2/settings.xml (not written by this script)"
+  fi
+  if [ -f "$SETTINGS_SEC" ]; then
+    if manifest_has m2-security; then
+      ustep "Delete ~/.m2/settings-security.xml (created by this script)" rm -f "$SETTINGS_SEC"
+    else
+      ukeep "~/.m2/settings-security.xml (no record that this script created it; if it did, delete it yourself)"
+    fi
+  fi
+  if [ -d "$PSCOE_REPO" ]; then
+    size="$(du -sh "$PSCOE_REPO" 2>/dev/null | cut -f1 || true)"
+    ustep "Delete Build Tools artifacts from the Maven cache: ~/.m2/repository/com/vmware/pscoe ($size, downloaded again when needed)" rm -rf "$PSCOE_REPO"
+  fi
+
+  # 4. shell environment
+  if [ -f "$ZPROFILE" ] && grep -qxF "$MARK_BEGIN" "$ZPROFILE"; then
+    ustep "Remove the Build Tools block (JAVA_HOME, PATH) from ~/.zprofile (backup: ~/.zprofile.bak-bt-uninstall)" u_do_zprofile
+  fi
+
+  # 5. everything under ~/.buildtools (Maven, certs, profiles, npm cache)
+  if [ -d "$BT_HOME" ]; then
+    size="$(du -sh "$BT_HOME" 2>/dev/null | cut -f1 || true)"
+    ustep "Delete $(tildify "$BT_HOME") ($size: Maven $MAVEN_VERSION, signing cert, profiles, npm cache)" rm -rf "$BT_HOME"
+  fi
+
+  # 6. shared tools: only with --remove-shared, and only what install itself installed
+  if command -v brew >/dev/null 2>&1; then
+    for f in openjdk@21 node@22 openssl@3; do
+      brew list --versions "$f" >/dev/null 2>&1 || continue
+      if ! manifest_has "brew:$f"; then
+        ukeep "Homebrew $f (no record that this script installed it)"
+      elif [ -z "$U_SHARED" ]; then
+        ukeep "Homebrew $f (installed by this script; add --remove-shared to remove it)"
+      else
+        deps="$(u_brew_deps "$f")"
+        if [ -n "$deps" ]; then ukeep "Homebrew $f (still needed by: $deps)"
+        else U_BREW_RM="$U_BREW_RM$f "; ustep "brew uninstall $f (installed by this script)" brew uninstall "$f"; fi
+      fi
+    done
+    if find_vscode_app >/dev/null; then
+      if ! manifest_has "cask:visual-studio-code"; then ukeep "Visual Studio Code (no record that this script installed it)"
+      elif [ -z "$U_SHARED" ]; then ukeep "Visual Studio Code (installed by this script; add --remove-shared to remove it)"
+      else ustep "brew uninstall --cask visual-studio-code (installed by this script; your VS Code settings stay)" brew uninstall --cask visual-studio-code
+      fi
+    fi
+  fi
+
+  # never touched
+  if [ -d "$HOME/BuildTools" ]; then
+    n="$(find "$HOME/BuildTools" -name pom.xml -maxdepth 3 2>/dev/null | wc -l | tr -d ' ')"
+    ukeep "~/BuildTools ($n project(s) - your code is never deleted)"
+  fi
+  for f in "$ZPROFILE.bak-bt" "$SETTINGS".bak-*; do
+    [ -f "$f" ] && [ "$f" != "$orig" ] && ukeep "$(tildify "$f") (old backup)"
+  done
+  ukeep "Homebrew itself, the rest of ~/.m2/repository, ~/.npm, and this repository folder"
+  return 0
+}
+
+cmd_uninstall() {
+  require_macos
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run)       U_DRY=1 ;;
+      --yes|-y)        U_YES=1 ;;
+      --remove-shared) U_SHARED=1 ;;
+      --no-backup)     U_NOBACKUP=1 ;;
+      *) die "Unknown option '$a' (use --dry-run, --yes, --remove-shared, --no-backup)" ;;
+    esac
+  done
+  # guard against a mis-set BT_HOME before anything is deleted
+  case "$BT_HOME" in /*) ;; *) die "BT_HOME must be an absolute path (got '$BT_HOME')" ;; esac
+  [ "${BT_HOME%/}" != "${HOME%/}" ] && [ "${BT_HOME%/}" != "" ] || die "Refusing to use BT_HOME=$BT_HOME"
+  if [ -d "$BT_HOME" ] && [ "$(basename "$BT_HOME")" != ".buildtools" ] && [ ! -f "$MANIFEST" ]; then
+    die "Refusing to delete $BT_HOME: it isn't called .buildtools and has no install record."
+  fi
+  if [ -d "$BT_HOME" ]; then
+    case "$(pwd -P)/" in "$(cd "$BT_HOME" && pwd -P)/"*) die "You are inside $BT_HOME - cd somewhere else first." ;; esac
+  fi
+  local pids; pids="$(pgrep -f "$BT_HOME/" 2>/dev/null | tr '\n' ' ' || true)"
+  [ -z "$pids" ] || die "Something is still running from $BT_HOME (PIDs: $pids). Stop Maven builds / close terminals first."
+
+  # work from a copy of the install record: ~/.buildtools (where it lives) is deleted mid-run
+  if [ -f "$MANIFEST" ]; then
+    U_MCOPY="$(mktemp)"; cp "$MANIFEST" "$U_MCOPY"; MANIFEST="$U_MCOPY"
+    trap 'rm -f "$U_MCOPY"' EXIT
+  fi
+  u_load_env
+  U_BACKUP="$HOME/bt-uninstall-backup-$(date +%Y%m%d%H%M%S).tar.gz"
+  [ -f "$MANIFEST" ] || [ ! -d "$BT_HOME" ] || warn "No install record found (installed with an older version of this script): only files this script certainly owns are removed."
+
+  log "Uninstall plan"
+  U_MODE=plan; U_COUNT=0; U_BREW_RM=" "; u_steps
+  [ "$U_COUNT" -gt 0 ] || skip "nothing to remove"
+  if [ -n "$U_KEPT" ]; then log "Kept"; printf '%s\n' "${U_KEPT#?}"; fi
+  [ "$U_COUNT" -gt 0 ] || return 0
+  if [ -n "$U_DRY" ]; then log "Dry run - nothing was changed."; return 0; fi
+  if [ -z "$U_YES" ]; then
+    yesno "Remove the items above?" n || { log "Nothing was changed."; return 0; }
+  fi
+
+  U_MODE=run; U_BREW_RM=" "; u_steps
+  if [ "$U_FAILED" -gt 0 ]; then warn "$U_FAILED step(s) failed - see above. Re-run './bt-setup.sh uninstall' after fixing them."
+  else log "Build Tools setup removed."; fi
+  skip "Open a NEW terminal: this one still has the old JAVA_HOME / PATH."
+  [ -f "$U_BACKUP" ] && skip "Backup: $(tildify "$U_BACKUP")"
+  skip "To set it up again later: ./bt-setup.sh install"
+  return 0
+}
+
 print_next_steps() {
   cat <<'NEXT'
 
@@ -578,7 +816,7 @@ cmd_install() {
   print_next_steps
 }
 
-usage() { sed -n "2,21p" "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n "3,26p" "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   install)        cmd_install ;;
@@ -586,5 +824,6 @@ case "${1:-}" in
   refresh-token)  shift; cmd_refresh_token "${1:-}" ;;
   new-project)    cmd_new_project ;;
   doctor)         cmd_doctor ;;
+  uninstall)      shift; cmd_uninstall "$@" ;;
   *)              usage ;;
 esac
